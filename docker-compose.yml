@@ -1,0 +1,112 @@
+# docker compose up            -> database + API on http://localhost:8080
+# docker compose run --rm seed -> load 10M+ ledger rows (see README)
+# docker compose run --rm tests / loadtest -> see README
+
+x-database-url: &database-url postgresql://wallet:wallet@db:5432/wallet
+
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: wallet
+      POSTGRES_PASSWORD: wallet
+      POSTGRES_DB: wallet
+    # Sized for a laptop. Durability settings (fsync, synchronous_commit) are
+    # left at their safe defaults: a 200 response means the write is on disk.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - effective_cache_size=3GB
+      - -c
+      - max_connections=200
+      - -c
+      - max_wal_size=8GB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - random_page_cost=1.1
+    shm_size: 1gb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wallet -d wallet"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build:
+      context: .
+      target: api
+    environment:
+      # Reviewers can override:  API_TOKEN=something docker compose up
+      API_TOKEN: ${API_TOKEN:-recruitment-test-token}
+      DATABASE_URL: *database-url
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-4}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-12}
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import os, urllib.request
+          request = urllib.request.Request(
+              "http://localhost:8080/health",
+              headers={"Authorization": "Bearer " + os.environ["API_TOKEN"]},
+          )
+          urllib.request.urlopen(request, timeout=2)
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    stop_grace_period: 30s
+
+  # The services below only run when asked for by name (docker compose run ...).
+  seed:
+    profiles: ["tools"]
+    build:
+      context: .
+      target: api
+    entrypoint: ["python", "-m", "scripts.seed"]
+    environment:
+      DATABASE_URL: *database-url
+    depends_on:
+      api:
+        condition: service_healthy
+
+  tests:
+    profiles: ["tools"]
+    build:
+      context: .
+      target: tools
+    command: ["pytest"]
+    environment:
+      API_TOKEN: ${API_TOKEN:-recruitment-test-token}
+      BASE_URL: http://api:8080
+      DATABASE_URL: *database-url
+    depends_on:
+      api:
+        condition: service_healthy
+
+  loadtest:
+    profiles: ["tools"]
+    build:
+      context: .
+      target: tools
+    entrypoint: ["python", "-m", "scripts.loadtest"]
+    environment:
+      API_TOKEN: ${API_TOKEN:-recruitment-test-token}
+      BASE_URL: http://api:8080
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
